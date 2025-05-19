@@ -7,7 +7,7 @@ This is a quickstart chat application example built with [SpacetimeDB](https://s
 Before you begin, ensure you have the following installed:
 
 *   [Rust](https://www.rust-lang.org/tools/install)
-*   [SpacetimeDB CLI](https://spacetimedb.com/docs/getting-started/installation)
+*   [SpacetimeDB CLI](https://spacetimedb.com/install)
 
 ## Setup and Installation
 
