@@ -1,8 +1,11 @@
-use serde::{Deserialize, Serialize};
+mod tables;
+use tables::*;
+
+mod reducers;
+
 use sha2::{Digest, Sha256};
-use spacetimedb::{ReducerContext, ScheduleAt, SpacetimeType, Table, TimeDuration, Timestamp};
+use spacetimedb::{ReducerContext, ScheduleAt, Table, TimeDuration, Timestamp};
 use std::collections::HashMap;
-use std::hash::Hash;
 
 // Hashcash 阈值常量
 const HASHCASH_THRESHOLDS: (u32, u32, u32) = (18, 10, 5); // (GOOD, WEAK, TRIVIAL)
@@ -31,107 +34,6 @@ const KEYWORDS: &[(&str, EmailClassification)] = &[
     ("invoice", EmailClassification::Updates),
     ("payment received", EmailClassification::Updates),
 ];
-
-// 邮件状态枚举
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, SpacetimeType)]
-pub enum EmailStatus {
-    Pending,
-    Sending,
-    Sent,
-    Failed,
-    Rejected,
-    Scheduled,
-    Spam,
-}
-
-// 邮件分类枚举
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, SpacetimeType)]
-pub enum EmailClassification {
-    Primary,
-    Promotions,
-    Social,
-    Forums,
-    Updates,
-}
-
-// 用户表
-#[spacetimedb::table(name = users)]
-// #[derive(Serialize, Deserialize, Clone)]
-pub struct User {
-    pub username: String,
-    pub domain: String,
-    pub password_hash: String,
-    pub iq: Option<i32>,
-    pub is_banned: bool,
-    pub is_admin: bool,
-    pub deleted_at: Option<Timestamp>, // Unix timestamp
-    pub created_at: Timestamp,         // Unix timestamp
-}
-
-// 用户会话表
-#[spacetimedb::table(name = user_secret_codes)]
-// #[derive(Serialize, Deserialize, Clone)]
-pub struct UserSecretCode {
-    pub code: String,
-    pub user_id: i32,
-    pub created_at: Timestamp, // Unix timestamp
-    pub ip: Option<String>,
-    pub user_agent: Option<String>,
-}
-
-// 邮件表
-#[spacetimedb::table(name = emails)]
-// #[derive(Serialize, Deserialize, Clone)]
-#[derive(Clone)]
-pub struct Email {
-    #[primary_key]
-    #[auto_inc]
-    pub id: i32,
-    pub from_address: String,
-    pub from_domain: String,
-    pub to_address: String,
-    pub to_domain: String,
-    pub subject: Option<String>,
-    pub body: Option<String>,
-    pub content_type: String,
-    pub html_body: Option<String>,
-    pub sent_at: Timestamp, // Unix timestamp
-    pub error_message: Option<String>,
-    pub status: EmailStatus,
-    pub snooze_until: Option<Timestamp>, // Unix timestamp
-    pub read_at: Option<Timestamp>,      // Unix timestamp
-    pub scheduled_at: Option<Timestamp>, // Unix timestamp
-    pub classification: EmailClassification,
-    pub reply_to_id: Option<i32>,
-    pub thread_id: Option<i32>,
-    pub expires_at: Option<Timestamp>, // Unix timestamp
-    pub self_destruct: bool,
-}
-
-// 附件表
-#[spacetimedb::table(name = attachments)]
-// #[derive(Serialize, Deserialize, Clone)]
-pub struct Attachment {
-    pub user_id: Option<i32>,
-    pub key: String,
-    pub filename: String,
-    pub size: i32,
-    pub file_type: String,
-    pub created_at: Timestamp,         // Unix timestamp
-    pub expires_at: Option<Timestamp>, // Unix timestamp
-    pub email_id: Option<i32>,
-    pub status: String,
-}
-
-// 用户设置表
-#[spacetimedb::table(name = user_settings)]
-// #[derive(Serialize, Deserialize, Clone)]
-pub struct UserSettings {
-    pub user_id: i32,
-    pub notifications_enabled: bool,
-    pub created_at: Timestamp, // Unix timestamp
-    pub updated_at: Timestamp, // Unix timestamp
-}
 
 // Hashcash 验证函数
 fn verify_hashcash(ctx: &ReducerContext, header: &str, resource: &str) -> Result<u32, String> {
@@ -337,6 +239,7 @@ pub fn client_disconnected(_ctx: &ReducerContext) {
 #[spacetimedb::reducer]
 pub fn register(ctx: &ReducerContext, username: String, domain: String, password_hash: String) {
     let user = User {
+        id: 0,
         username,
         domain,
         password_hash,
