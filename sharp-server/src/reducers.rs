@@ -1,15 +1,12 @@
 #![allow(unused_variables)]
 
-use crate::tables::*;
 use crate::{
-    check_vocabulary, classify_email, parse_sharp_address, parse_sharp_message, verify_hashcash,
-    EmailClassification, EmailStatus, SharpMessageType, PROTOCOL_VERSION,
+    check_vocabulary, classify_email, parse_sharp_address, parse_sharp_message,
+    EmailClassification, SharpMessageType, HASHCASH_THRESHOLDS, PROTOCOL_VERSION,
 };
+use crate::{tables::*, verify_hashcash};
 use sha2::{Digest, Sha256};
 use spacetimedb::{ReducerContext, Table, Timestamp};
-
-// Hashcash 阈值常量
-const HASHCASH_THRESHOLDS: (u32, u32, u32) = (18, 10, 5); // (GOOD, WEAK, TRIVIAL)
 
 // Email Star 相关操作
 #[spacetimedb::reducer]
@@ -774,91 +771,6 @@ pub fn mark_email_as_spam(ctx: &ReducerContext, email_id: i32, user_id: i32) -> 
     Ok(())
 }
 
-// 邮件发送相关操作
-#[spacetimedb::reducer]
-#[allow(clippy::too_many_arguments)]
-pub fn send_email(
-    ctx: &ReducerContext,
-    from_address: String,
-    from_domain: String,
-    to_address: String,
-    to_domain: String,
-    subject: Option<String>,
-    body: Option<String>,
-    content_type: String,
-    html_body: Option<String>,
-    hashcash: String,
-    scheduled_at: Option<Timestamp>,
-    reply_to_id: Option<i32>,
-    thread_id: Option<i32>,
-    expires_at: Option<Timestamp>,
-    self_destruct: bool,
-) -> Result<(), String> {
-    // 验证 Hashcash
-    let bits = verify_hashcash(ctx, &hashcash, &to_address)?;
-
-    // 确定邮件状态
-    let status = if bits >= HASHCASH_THRESHOLDS.0 {
-        EmailStatus::Pending
-    } else if bits >= HASHCASH_THRESHOLDS.1 {
-        EmailStatus::Spam
-    } else {
-        return Err(format!(
-            "Insufficient proof of work. Please retry with at least {} bits.",
-            HASHCASH_THRESHOLDS.2
-        ));
-    };
-
-    // 验证发送者
-    let sender = ctx
-        .db
-        .users()
-        .iter()
-        .find(|u| u.username == from_address && u.domain == from_domain)
-        .ok_or_else(|| "Sender not found".to_string())?;
-
-    // 检查词汇（如果是纯文本邮件）
-    if content_type == "text/plain" {
-        if let Some(body) = &body {
-            check_vocabulary(body, sender.iq)?;
-        }
-    }
-
-    // 分类邮件
-    let classification = classify_email(
-        subject.as_deref().unwrap_or(""),
-        body.as_deref().unwrap_or(""),
-        html_body.as_deref(),
-    );
-
-    // 创建邮件记录
-    let email = Email {
-        id: 0,
-        from_address,
-        from_domain,
-        to_address,
-        to_domain,
-        subject,
-        body,
-        content_type,
-        html_body,
-        sent_at: ctx.timestamp,
-        error_message: None,
-        status,
-        snooze_until: None,
-        read_at: None,
-        scheduled_at,
-        classification,
-        reply_to_id,
-        thread_id,
-        expires_at,
-        self_destruct,
-    };
-
-    ctx.db.emails().insert(email);
-    Ok(())
-}
-
 // SHARP 协议交互
 #[spacetimedb::reducer]
 pub fn handle_sharp_message(ctx: &ReducerContext, raw_message: String) -> Result<(), String> {
@@ -988,4 +900,156 @@ pub fn handle_sharp_message(ctx: &ReducerContext, raw_message: String) -> Result
 
         _ => Err("Unexpected message type".to_string()),
     }
+}
+
+// 用户注册
+#[spacetimedb::reducer]
+pub fn register(ctx: &ReducerContext, username: String, domain: String, password_hash: String) {
+    let user = User {
+        id: 0,
+        username,
+        domain,
+        password_hash,
+        iq: None,
+        is_banned: false,
+        is_admin: false,
+        deleted_at: None,
+        created_at: ctx.timestamp,
+    };
+
+    ctx.db.users().insert(user);
+    log::info!("New user registered");
+}
+
+// 创建会话
+#[spacetimedb::reducer]
+pub fn create_session(
+    ctx: &ReducerContext,
+    user_id: i32,
+    code: String,
+    ip: Option<String>,
+    user_agent: Option<String>,
+) {
+    let session = UserSecretCode {
+        code,
+        user_id,
+        created_at: ctx.timestamp,
+        ip,
+        user_agent,
+    };
+
+    ctx.db.user_secret_codes().insert(session);
+    log::info!("New session created for user {}", user_id);
+}
+
+// 发送邮件
+#[spacetimedb::reducer]
+#[allow(clippy::too_many_arguments)]
+pub fn send_email(
+    ctx: &ReducerContext,
+    from_address: String,
+    from_domain: String,
+    to_address: String,
+    to_domain: String,
+    subject: Option<String>,
+    body: Option<String>,
+    content_type: String,
+    html_body: Option<String>,
+    hashcash: String,
+    scheduled_at: Option<Timestamp>,
+    reply_to_id: Option<i32>,
+    thread_id: Option<i32>,
+    expires_at: Option<Timestamp>,
+    self_destruct: bool,
+) -> Result<(), String> {
+    // 验证 Hashcash
+    let bits = verify_hashcash(ctx, &hashcash, &to_address)?;
+
+    // 确定邮件状态
+    let status = if bits >= HASHCASH_THRESHOLDS.0 {
+        EmailStatus::Pending
+    } else if bits >= HASHCASH_THRESHOLDS.1 {
+        EmailStatus::Spam
+    } else {
+        return Err(format!(
+            "Insufficient proof of work. Please retry with at least {} bits.",
+            HASHCASH_THRESHOLDS.2
+        ));
+    };
+
+    // 验证发送者
+    let sender = ctx
+        .db
+        .users()
+        .iter()
+        .find(|u| u.username == from_address && u.domain == from_domain)
+        .ok_or_else(|| "Sender not found".to_string())?;
+
+    // 检查词汇（如果是纯文本邮件）
+    if content_type == "text/plain" {
+        if let Some(body) = &body {
+            check_vocabulary(body, sender.iq)?;
+        }
+    }
+
+    // 分类邮件
+    let classification = classify_email(
+        subject.as_deref().unwrap_or(""),
+        body.as_deref().unwrap_or(""),
+        html_body.as_deref(),
+    );
+
+    // 创建邮件记录
+    let email = Email {
+        id: 0,
+        from_address,
+        from_domain,
+        to_address,
+        to_domain,
+        subject,
+        body,
+        content_type,
+        html_body,
+        sent_at: ctx.timestamp,
+        error_message: None,
+        status,
+        snooze_until: None,
+        read_at: None,
+        scheduled_at,
+        classification,
+        reply_to_id,
+        thread_id,
+        expires_at,
+        self_destruct,
+    };
+
+    ctx.db.emails().insert(email);
+    Ok(())
+}
+
+// 邮件投递状态更新
+#[spacetimedb::reducer]
+pub fn update_email_status(
+    ctx: &ReducerContext,
+    email_id: i32,
+    new_status: EmailStatus,
+    error_message: Option<String>,
+) -> Result<(), String> {
+    let email = ctx
+        .db
+        .emails()
+        .iter()
+        .find(|e| e.id == email_id)
+        .ok_or_else(|| "Email not found".to_string())?;
+
+    let mut updated_email = email.clone();
+    updated_email.status = new_status;
+    updated_email.error_message = error_message;
+
+    if new_status == EmailStatus::Sent {
+        updated_email.sent_at = ctx.timestamp;
+    }
+
+    ctx.db.emails().id().update(updated_email);
+    Ok(())
 }
