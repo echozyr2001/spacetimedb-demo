@@ -1,179 +1,13 @@
 mod tables;
-use tables::*;
+pub use tables::*;
 
 mod reducers;
+pub use reducers::*;
 
-use sha2::{Digest, Sha256};
+mod utils;
+pub use utils::*;
+
 use spacetimedb::{ReducerContext, ScheduleAt, Table, TimeDuration, Timestamp};
-use std::collections::HashMap;
-
-// Hashcash 阈值常量
-const HASHCASH_THRESHOLDS: (u32, u32, u32) = (18, 10, 5); // (GOOD, WEAK, TRIVIAL)
-
-// 邮件分类关键词
-const KEYWORDS: &[(&str, EmailClassification)] = &[
-    // Promotions
-    ("sale", EmailClassification::Promotions),
-    ("discount", EmailClassification::Promotions),
-    ("buy now", EmailClassification::Promotions),
-    ("limited time", EmailClassification::Promotions),
-    ("offer", EmailClassification::Promotions),
-    // Social
-    ("friend request", EmailClassification::Social),
-    ("mentioned you", EmailClassification::Social),
-    ("liked your post", EmailClassification::Social),
-    ("new follower", EmailClassification::Social),
-    // Forums
-    ("digest", EmailClassification::Forums),
-    ("thread", EmailClassification::Forums),
-    ("post reply", EmailClassification::Forums),
-    ("new topic", EmailClassification::Forums),
-    // Updates
-    ("receipt", EmailClassification::Updates),
-    ("order confirmation", EmailClassification::Updates),
-    ("invoice", EmailClassification::Updates),
-    ("payment received", EmailClassification::Updates),
-];
-
-// Hashcash 验证函数
-fn verify_hashcash(ctx: &ReducerContext, header: &str, resource: &str) -> Result<u32, String> {
-    let parts: Vec<&str> = header.split(':').collect();
-    if parts.len() != 7 {
-        return Err("Invalid hashcash format".to_string());
-    }
-
-    let (version, bits, date, header_resource, _ext, _rand, _counter) = (
-        parts[0], parts[1], parts[2], parts[3], parts[4], parts[5], parts[6],
-    );
-
-    if version != "1" {
-        return Err("Unsupported hashcash version".to_string());
-    }
-
-    if header_resource != resource {
-        return Err("Resource mismatch".to_string());
-    }
-
-    let bits = bits
-        .parse::<u32>()
-        .map_err(|_| "Invalid bits value".to_string())?;
-
-    // 验证日期
-    let header_date = parse_hashcash_date(date)?;
-    let now = ctx.timestamp;
-    let one_hour = TimeDuration::from_micros(3600 * 1_000_000);
-    if now > header_date + one_hour {
-        return Err("Hashcash stamp expired".to_string());
-    }
-
-    // 验证工作量证明
-    let hash = Sha256::digest(header.as_bytes());
-    let leading_zeros = count_leading_zeros(&hash);
-
-    if leading_zeros < bits {
-        return Err("Insufficient proof of work".to_string());
-    }
-
-    Ok(bits)
-}
-
-// 解析 Hashcash 日期
-fn parse_hashcash_date(date_str: &str) -> Result<Timestamp, String> {
-    if date_str.len() != 10 {
-        return Err("Invalid date format".to_string());
-    }
-
-    let year = 2000
-        + date_str[0..2]
-            .parse::<i32>()
-            .map_err(|_| "Invalid year".to_string())?;
-    let month = date_str[2..4]
-        .parse::<u32>()
-        .map_err(|_| "Invalid month".to_string())?;
-    let day = date_str[4..6]
-        .parse::<u32>()
-        .map_err(|_| "Invalid day".to_string())?;
-    let hour = date_str[6..8]
-        .parse::<u32>()
-        .map_err(|_| "Invalid hour".to_string())?;
-    let minute = date_str[8..10]
-        .parse::<u32>()
-        .map_err(|_| "Invalid minute".to_string())?;
-
-    // Convert to microseconds since Unix epoch
-    let micros = (year as i64 * 365 * 24 * 60 * 60 * 1_000_000)
-        + ((month - 1) as i64 * 30 * 24 * 60 * 60 * 1_000_000)
-        + ((day - 1) as i64 * 24 * 60 * 60 * 1_000_000)
-        + (hour as i64 * 60 * 60 * 1_000_000)
-        + (minute as i64 * 60 * 1_000_000);
-    Ok(Timestamp::from_micros_since_unix_epoch(micros))
-}
-
-// 计算前导零位数
-fn count_leading_zeros(hash: &[u8]) -> u32 {
-    let mut zeros = 0;
-    for &byte in hash {
-        if byte == 0 {
-            zeros += 8;
-        } else {
-            zeros += byte.leading_zeros();
-            break;
-        }
-    }
-    zeros
-}
-
-// 邮件分类函数
-fn classify_email(subject: &str, body: &str, html_body: Option<&str>) -> EmailClassification {
-    let text = format!("{} {}", subject, body).to_lowercase();
-    let mut scores = HashMap::new();
-
-    // 基于关键词的评分
-    for (keyword, classification) in KEYWORDS {
-        if text.contains(keyword) {
-            *scores.entry(classification).or_insert(0) += 1;
-        }
-    }
-
-    // HTML 结构评分（用于识别促销邮件）
-    if let Some(html) = html_body {
-        let html_score = html.matches("<img").count()
-            + html.matches("<table").count()
-            + html.matches("<style").count();
-        *scores.entry(&EmailClassification::Promotions).or_insert(0) += html_score.min(5);
-    }
-
-    // 返回得分最高的分类
-    scores
-        .into_iter()
-        .max_by_key(|&(_, score)| score)
-        .map(|(classification, _)| *classification)
-        .unwrap_or(EmailClassification::Primary)
-}
-
-// 词汇检查函数
-fn check_vocabulary(text: &str, iq: Option<i32>) -> Result<(), String> {
-    let max_word_length = match iq {
-        Some(iq) if iq < 90 => 3,
-        Some(iq) if iq < 100 => 4,
-        Some(iq) if iq < 120 => 5,
-        Some(iq) if iq < 130 => 6,
-        Some(iq) if iq < 140 => 7,
-        _ => return Ok(()), // 无限制
-    };
-
-    for word in text.split_whitespace() {
-        let cleaned_word = word.trim_matches(|c: char| !c.is_alphanumeric());
-        if cleaned_word.len() > max_word_length {
-            return Err(format!(
-                "Word '{}' exceeds maximum length of {} characters for your IQ level",
-                cleaned_word, max_word_length
-            ));
-        }
-    }
-
-    Ok(())
-}
 
 #[spacetimedb::table(name = email_schedule, scheduled(process_pending_emails))]
 pub struct EmailSchedule {
@@ -199,27 +33,108 @@ pub struct CleanupSchedule {
     scheduled_at: ScheduleAt,
 }
 
+// 处理待发送的邮件
+#[spacetimedb::reducer]
+pub fn process_pending_emails(ctx: &ReducerContext, _schedule: EmailSchedule) {
+    log::info!("Processing pending emails");
+
+    let now = ctx.timestamp;
+    let thirty_seconds = TimeDuration::from_micros(30_000_000);
+
+    // 处理超时的待发送邮件
+    let pending_emails = ctx
+        .db
+        .emails()
+        .iter()
+        .filter(|e| e.status == EmailStatus::Pending && e.sent_at + thirty_seconds < now)
+        .collect::<Vec<_>>();
+
+    for email in pending_emails {
+        let mut updated_email = email.clone();
+        updated_email.status = EmailStatus::Failed;
+        updated_email.error_message = Some("Timed out while pending".to_string());
+        ctx.db.emails().id().update(updated_email);
+    }
+}
+
+// 处理定时发送的邮件
+#[spacetimedb::reducer]
+pub fn process_scheduled_emails(ctx: &ReducerContext, _schedule: ScheduledEmails) {
+    log::info!("Processing scheduled emails");
+
+    let now = ctx.timestamp;
+    let scheduled_emails = ctx
+        .db
+        .emails()
+        .iter()
+        .filter(|e| e.status == EmailStatus::Scheduled && e.scheduled_at.unwrap_or(now) <= now)
+        .collect::<Vec<_>>();
+
+    for email in scheduled_emails {
+        let mut updated_email = email.clone();
+        updated_email.status = EmailStatus::Pending;
+        ctx.db.emails().id().update(updated_email);
+    }
+}
+
+// 清理过期的邮件
+#[spacetimedb::reducer]
+pub fn cleanup_expired_emails(ctx: &ReducerContext, _schedule: CleanupSchedule) {
+    log::info!("Cleaning up expired emails");
+
+    let now = ctx.timestamp;
+
+    // 查找所有过期的邮件
+    let expired_emails = ctx
+        .db
+        .emails()
+        .iter()
+        .filter(|e| e.expires_at.unwrap_or(now) <= now)
+        .collect::<Vec<_>>();
+
+    for email in expired_emails {
+        // 删除相关的附件
+        let attachments = ctx
+            .db
+            .attachments()
+            .iter()
+            .filter(|a| a.email_id == Some(email.id))
+            .collect::<Vec<_>>();
+
+        for attachment in attachments {
+            ctx.db.attachments().id().delete(attachment.id);
+        }
+
+        // 删除邮件
+        ctx.db.emails().id().delete(email.id);
+    }
+}
+
 // 初始化函数
 #[spacetimedb::reducer(init)]
 pub fn init(ctx: &ReducerContext) {
-    log::info!("SHARP server initialized");
+    log::info!("Initializing SHARP server");
 
     // 设置定时任务
-    let interval = TimeDuration::from_micros(60_000_000);
+    let one_minute = TimeDuration::from_micros(60_000_000);
+    let five_minutes = TimeDuration::from_micros(300_000_000);
 
+    // 处理待发送邮件的定时任务
     ctx.db.email_schedule().insert(EmailSchedule {
         scheduled_id: 0,
-        scheduled_at: ScheduleAt::Interval(interval),
+        scheduled_at: ScheduleAt::Interval(one_minute),
     });
 
+    // 处理定时发送邮件的定时任务
     ctx.db.scheduled_emails().insert(ScheduledEmails {
         scheduled_id: 0,
-        scheduled_at: ScheduleAt::Interval(interval),
+        scheduled_at: ScheduleAt::Interval(one_minute),
     });
 
+    // 清理过期邮件的定时任务
     ctx.db.cleanup_schedule().insert(CleanupSchedule {
         scheduled_id: 0,
-        scheduled_at: ScheduleAt::Interval(TimeDuration::from_micros(300_000_000)),
+        scheduled_at: ScheduleAt::Interval(five_minutes),
     });
 }
 
@@ -385,93 +300,4 @@ pub fn update_email_status(
 
     ctx.db.emails().id().update(updated_email);
     Ok(())
-}
-
-// 处理待发送的邮件
-#[spacetimedb::reducer]
-pub fn process_pending_emails(ctx: &ReducerContext, _schedule: EmailSchedule) {
-    log::info!("Start process_pending_emails");
-
-    let pending_emails = ctx
-        .db
-        .emails()
-        .iter()
-        .filter(|e| e.status == EmailStatus::Pending)
-        .collect::<Vec<_>>();
-
-    for email in pending_emails {
-        // 更新状态为发送中
-        let mut updated_email = email.clone();
-        updated_email.status = EmailStatus::Sending;
-        ctx.db.emails().insert(updated_email);
-
-        // 如果是本地邮件，直接标记为已发送
-        let is_local_user = ctx
-            .db
-            .users()
-            .iter()
-            .any(|u| u.username == email.to_address && u.domain == email.to_domain);
-
-        if is_local_user {
-            let mut sent_email = email.clone();
-            sent_email.status = EmailStatus::Sent;
-            sent_email.sent_at = ctx.timestamp;
-            ctx.db.emails().insert(sent_email);
-            continue;
-        }
-
-        // TODO: 实现远程邮件投递
-        // 这里需要实现 SHARP 协议的远程投递逻辑
-    }
-}
-
-// 处理定时发送的邮件
-#[spacetimedb::reducer]
-pub fn process_scheduled_emails(ctx: &ReducerContext, _schedule: ScheduledEmails) {
-    log::info!("Start process_scheduled_emails");
-
-    let now = ctx.timestamp;
-    let scheduled_emails = ctx
-        .db
-        .emails()
-        .iter()
-        .filter(|e| e.status == EmailStatus::Scheduled && e.scheduled_at.unwrap_or(now) <= now)
-        .collect::<Vec<_>>();
-
-    for email in scheduled_emails {
-        let mut updated_email = email.clone();
-        updated_email.status = EmailStatus::Pending;
-        ctx.db.emails().insert(updated_email);
-    }
-}
-
-// 清理过期的邮件
-#[spacetimedb::reducer]
-pub fn cleanup_expired_emails(ctx: &ReducerContext, _schedule: CleanupSchedule) {
-    log::info!("Start cleanup_expired_emails");
-
-    let now = ctx.timestamp;
-    let expired_emails = ctx
-        .db
-        .emails()
-        .iter()
-        .filter(|e| e.expires_at.unwrap_or(now) <= now)
-        .collect::<Vec<_>>();
-
-    for email in expired_emails {
-        // 删除相关的附件
-        let attachments = ctx
-            .db
-            .attachments()
-            .iter()
-            .filter(|a| a.email_id == email.reply_to_id)
-            .collect::<Vec<_>>();
-
-        for attachment in attachments {
-            ctx.db.attachments().delete(attachment);
-        }
-
-        // 删除邮件
-        ctx.db.emails().delete(email);
-    }
 }
